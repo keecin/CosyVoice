@@ -1,0 +1,34 @@
+# 基于“当前昇腾容器镜像”的 CosyVoice Docker 安装文件（方案 A：源码目录 + PYTHONPATH）
+#
+# 使用方式（构建上下文必须是“已打补丁的 CosyVoice 仓库根目录”，且 third_party/
+# Matcha-TTS 子模块内容已存在）：
+#   git submodule update --init --recursive         # 确保 third_party/Matcha-TTS 非空
+#   docker build -f docker/Dockerfile.npu -t cosyvoice-npu:latest .
+#
+# 重要：`<YOUR_ASCEND_IMAGE:TAG>` 请替换为你当前正在使用的昇腾镜像（含 torch_npu /
+# vllm_ascend / CANN / onnxruntime-cann / Python3.12）。本文件不改动基础镜像的单卡/
+# 多卡运行方式（设备与驱动挂载沿用你原来启动该镜像的参数，仅更换镜像 tag）。
+
+FROM <YOUR_ASCEND_IMAGE:TAG>
+
+# ---- 1) 拷贝“已打补丁”的 CosyVoice 源码（务必包含 third_party/Matcha-TTS）----
+# 注意：build context 里要带 Matcha-TTS 内容；若为空会用不了（import matcha 失败）。
+COPY . /opt/CosyVoice
+
+# ---- 2) 追加 PYTHONPATH（仓库根 + Matcha-TTS），不要覆盖基础镜像已有的路径 ----
+# 若你的基础镜像没有定义 PYTHONPATH ENV，请改用文末“方案 B（.pth）”更稳妥。
+ENV PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS:${PYTHONPATH}
+WORKDIR /opt/CosyVoice
+
+# ---- 3) 只安装“缺失依赖”（严禁用官方 requirements.txt：它锁 CUDA torch/onnxruntime-gpu/tensorrt）----
+RUN pip install --no-cache-dir -r requirements-npu.txt \
+        -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com \
+ && pip install --no-cache-dir --only-binary=:all: pyarrow==18.1.0 \
+        -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# ---- 4) （可选）预生成 gRPC pb2，使 runtime/python/grpc 开箱可用 ----
+RUN cd runtime/python/grpc && bash update_grpc_file.sh
+
+# ---- 5) 不打包模型权重（体积大），运行时挂载或下载到 pretrained_models/ ----
+# 默认进入 bash；实际推理/服务命令见 docs/DOCKER_INSTALL_CN.md
+CMD ["bash"]

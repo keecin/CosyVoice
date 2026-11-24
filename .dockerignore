@@ -1,0 +1,14 @@
+# 忽略大文件/产物，加速 docker build 并避免把无关内容打进镜像
+.git
+.gitmodules
+**/__pycache__/
+*.py[cod]
+pretrained_models/
+outputs/
+*.wav
+*.m4a
+*.aac
+*.pt
+kernel_meta/
+*.om
+saved_audio/
