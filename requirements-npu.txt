@@ -1,0 +1,27 @@
+# Ascend NPU extra dependencies for CosyVoice2/3 inference on the current image.
+#
+# IMPORTANT:
+#   - Do NOT install the upstream requirements.txt on the NPU image: it pins
+#     torch==2.3.1 / onnxruntime-gpu / tensorrt-cu12 and would break torch_npu.
+#   - torch / torch_npu / numpy (1.26.4) / transformers are inherited from the
+#     base image. No transformers downgrade / venv is required: CosyVoice's
+#     KV-cache incremental decoding in cosyvoice/llm/llm.py was patched to be
+#     compatible with the system transformers 5.x (forward_one_step now builds
+#     the attention mask from past+current length).
+#   - pyarrow must stay numpy-1.26 compatible (18.1.0); the base image ships a
+#     numpy-2 ABI build that fails to import.
+
+hyperpyyaml==1.2.3
+conformer==0.3.2
+inflect==7.3.1
+pyworld==0.3.4
+tensorboard==2.14.0
+# wetext 0.2.1 bundles the FST models inside the wheel, so it never contacts
+# modelscope (0.0.4 downloads from pengzhendong/wetext which returns 403 here).
+wetext==0.2.1
+kaldifst
+grpcio-tools
+gdown
+wget
+lightning
+pyarrow==18.1.0
