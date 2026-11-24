@@ -45,7 +45,65 @@ except ImportError:
 import threading
 import time
 import uuid
+
+# --- Ascend + vLLM 0.30 runtime fixes (MUST run before `import vllm`) ---------
+# Engine mode depends on the exported vLLM model architecture:
+#  - CosyVoice2ForCausalLM (v2, use_bias=True): custom class -> V1 engine must run
+#    in-process so the registration is visible.
+#  - Qwen2ForCausalLM (v3, use_bias=False): stock Qwen2, no registration ->
+#    use MindIE-style multi-process V1 (spawn) for parity/perf.
+
+
+def _vllm_exported_is_custom(model_dir):
+    try:
+        import json as _json
+        cfg = os.path.join(model_dir, 'vllm', 'config.json')
+        archs = _json.load(open(cfg, encoding='utf-8')).get('architectures') or []
+        return 'CosyVoice2ForCausalLM' in archs
+    except Exception:
+        return False
+
+
+def _model_dir_from_argv(argv):
+    for i, a in enumerate(argv):
+        if a == '--model_dir' and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith('--model_dir='):
+            return a.split('=', 1)[1]
+    return ''
+
+
+_CUSTOM_ARCH = _vllm_exported_is_custom(_model_dir_from_argv(sys.argv))
+if _CUSTOM_ARCH:
+    os.environ.setdefault('VLLM_ENABLE_V1_MULTIPROCESSING', '0')
+else:
+    # MindIE-style multi-process V1; spawn is required on NPU (no fork re-init).
+    os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+# Equivalent to the image's torch TMA patch (without editing torch): make
+# torch.cuda.get_device_capability() non-None on NPU so dynamo's
+# _device_supports_tma() does not crash on `None >= (9,0)`. Format major.minor.
+os.environ.setdefault('TORCH_NPU_DEVICE_CAPABILITY', '8.0')
+# 2) this image reports both nvidia+ascend triton drivers -> vllm disables
+#    triton -> vllm_ascend triton kernels break. Mark nvidia backend inactive.
+try:
+    from triton.backends import backends
+    _nb = backends.get('nvidia')
+    if _nb is not None and getattr(_nb, 'driver', None) is not None:
+        _nb.driver.is_active = lambda: False
+except Exception:
+    pass
+# -----------------------------------------------------------------------------
+
 import vllm
+if _CUSTOM_ARCH:
+    # v2: register the custom architecture (only effective for in-process engine)
+    try:
+        from vllm import ModelRegistry
+        from cosyvoice.vllm.cosyvoice2 import CosyVoice2ForCausalLM
+        ModelRegistry.register_model("CosyVoice2ForCausalLM", CosyVoice2ForCausalLM)
+    except Exception as _e:
+        logging.warning(f"register CosyVoice2ForCausalLM failed: {_e}")
+
 import queue
 import torchair as tng
 from torchair.configs.compiler_config import CompilerConfig
@@ -340,6 +398,9 @@ class Token2Wave():
             self.inference_event.wait()
             self.inference_event.clear()
 
+            # NOTE this thread is not started by default (the service drives
+            # add_requests()/step() itself); fixed the previous
+            # `self.inputs` NameError here for anyone re-enabling it.
             if self.batches_requests.empty():
                 continue
 
@@ -410,6 +471,45 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
         self.inference_work_thread = threading.Thread(target=self.infer, daemon=True)
         self.inference_work_thread.start()
 
+        # 方案1：在 gRPC 线程启动前，先跑一遍完整流水线，触发 CANN TBE
+        # 知识库(repository_manager)与 Flow/HiFi 算子的懒加载/编译，使其在
+        # “没有 gRPC 线程”的环境里完成初始化（避免多线程里 fork 崩溃）。
+        # 跳过：--no_prewarm / graph_mode（Token2Wave 已在 init 编译图，预热无必要且会卡）/ 无 speaker。
+        _skip_prewarm = None
+        if getattr(args, 'no_prewarm', False):
+            _skip_prewarm = '--no_prewarm'
+        elif getattr(args, 'graph_mode', False):
+            _skip_prewarm = 'graph_mode'
+        elif not getattr(self, 'prompt_emb', None):
+            _skip_prewarm = 'no speaker available'
+        if _skip_prewarm:
+            thc_print(f"prewarm (pre-grpc): skipped ({_skip_prewarm})")
+        else:
+            thc_print("prewarm (pre-grpc): start")
+            _prewarm_timeout = getattr(args, 'prewarm_timeout', 300)
+            _pw_err = {}
+
+            def _pw_run():
+                try:
+                    self.warmup()
+                except BaseException as _e:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+                    _pw_err['e'] = _e
+
+            _pw = threading.Thread(target=_pw_run, daemon=True)
+            _pw.start()
+            _pw.join(timeout=_prewarm_timeout)
+            if _pw.is_alive():
+                raise RuntimeError(
+                    f"prewarm did not finish within {_prewarm_timeout}s; refusing to start. "
+                    "Operator compilation would then fork inside the multithreaded gRPC "
+                    "context and crash (see docs/bugfixes/04). Increase --prewarm_timeout, "
+                    "or pass --no_prewarm only if the operator cache is already warm.")
+            if 'e' in _pw_err:
+                raise RuntimeError(f"prewarm failed: {_pw_err['e']!r}; refusing to start")
+            thc_print("prewarm (pre-grpc): done")
+
         # 启动vllm profile（通过参数控制）
         if args.enable_vllm_profile:
             assert False
@@ -454,6 +554,10 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
             requests_remain_token_len[request_id] = new_token_len
             calc_cum_dt = (now - request_info.metric.t2w[0].end).total_seconds()
             requests_slack[request_id] = request_info.speech_cum_dt - calc_cum_dt
+
+        if len(requests_remain_token_len) == 0:
+            # no pending non-first tokens for any request -> nothing to schedule
+            return {}
 
         flag = [len(request_info.sections) >= 1 for request_info in self.requests_info.values()]
         available_token_len = self.t2w_total_token_len[len(flag) == args.max_conc and all(flag)]
@@ -1035,10 +1139,13 @@ def main():
     grpcServer.add_insecure_port('0.0.0.0:{}'.format(args.port))
     grpcServer.start()
 
-    if args.graph_mode:
-        thc_print(f"warmup: start")
+    # Non-graph: pre-warm already ran in __init__ (before gRPC threads) to avoid
+    # CANN TBE fork-in-multithread crashes. graph_mode: MindIE-style warmup
+    # runs here AFTER gRPC start (t2w graph compiled at Token2Wave init).
+    if getattr(args, 'graph_mode', False):
+        thc_print("warmup (post-grpc, graph_mode): start")
         service.warmup()
-        thc_print(f"warmup: end")
+        thc_print("warmup (post-grpc, graph_mode): done")
 
     logging.info("server listening on 0.0.0.0:{}".format(args.port))
     grpcServer.wait_for_termination()
@@ -1066,6 +1173,13 @@ if __name__ == '__main__':
     parser.add_argument('--enable_vllm_profile',
                         action='store_true',
                         help='whether to enable vLLM profiling (default: False)')
+    parser.add_argument('--prewarm_timeout',
+                        type=int,
+                        default=300,
+                        help='seconds to wait for the pre-gRPC warmup before continuing (default 300)')
+    parser.add_argument('--no_prewarm',
+                        action='store_true',
+                        help='skip the pre-gRPC warmup (not recommended: operator compilation may fork in multithreaded gRPC context)')
     args = parser.parse_args()
     logging.info(f"args：{args}")
     main()
