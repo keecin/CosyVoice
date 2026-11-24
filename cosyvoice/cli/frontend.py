@@ -26,6 +26,8 @@ import inflect
 from cosyvoice.utils.file_utils import logging, load_wav
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph, is_only_punctuation
 
+# taohouchao
+import threading
 
 class CosyVoiceFrontEnd:
 
@@ -50,6 +52,8 @@ class CosyVoiceFrontEnd:
             self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:
             self.spk2info = {}
+        print(f"spk2info file = {spk2info}, CosyVoiceFrontEnd.spk2info = {self.spk2info.keys()}")
+        self.spk2info_sft = {}
         self.allowed_special = allowed_special
         self.inflect_parser = inflect.engine()
         # NOTE compatible when no text frontend tool is avaliable
@@ -74,6 +78,13 @@ class CosyVoiceFrontEnd:
                 self.text_frontend = ''
                 logging.info('no frontend is avaliable')
 
+        self.lock = threading.Lock()
+
+    # taohouchao
+    def tokenizer_encode_with_lock(self, *args, **kwargs):
+        with self.lock:
+            output = self.tokenizer.encode(*args, **kwargs)
+        return output
 
     def _extract_text_token(self, text):
         if isinstance(text, Generator):
@@ -81,7 +92,7 @@ class CosyVoiceFrontEnd:
             # NOTE add a dummy text_token_len for compatibility
             return self._extract_text_token_generator(text), torch.tensor([0], dtype=torch.int32).to(self.device)
         else:
-            text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)
+            text_token = self.tokenizer_encode_with_lock(text, allowed_special=self.allowed_special)
             text_token = torch.tensor([text_token], dtype=torch.int32).to(self.device)
             text_token_len = torch.tensor([text_token.shape[1]], dtype=torch.int32).to(self.device)
             return text_token, text_token_len
@@ -148,13 +159,13 @@ class CosyVoiceFrontEnd:
                 text = text.replace(" - ", "，")
                 text = remove_bracket(text)
                 text = re.sub(r'[，,、]+$', '。', text)
-                texts = list(split_paragraph(text, partial(self.tokenizer.encode, allowed_special=self.allowed_special), "zh", token_max_n=80,
+                texts = list(split_paragraph(text, partial(self.tokenizer_encode_with_lock, allowed_special=self.allowed_special), "zh", token_max_n=80,
                                              token_min_n=60, merge_len=20, comma_split=False))
             else:
                 if self.text_frontend == 'wetext':
                     text = self.en_tn_model.normalize(text)
                 text = spell_out_number(text, self.inflect_parser)
-                texts = list(split_paragraph(text, partial(self.tokenizer.encode, allowed_special=self.allowed_special), "en", token_max_n=80,
+                texts = list(split_paragraph(text, partial(self.tokenizer_encode_with_lock, allowed_special=self.allowed_special), "en", token_max_n=80,
                                              token_min_n=60, merge_len=20, comma_split=False))
         texts = [i for i in texts if not is_only_punctuation(i)]
         return texts if split is True else text
@@ -222,3 +233,13 @@ class CosyVoiceFrontEnd:
                        'prompt_speech_feat': prompt_speech_feat, 'prompt_speech_feat_len': prompt_speech_feat_len,
                        'flow_embedding': embedding}
         return model_input
+
+    def frontend_from_spk2info(self, spk_id):
+        spk_info = self.spk2info[spk_id]
+        embedding = spk_info['embedding'].to(self.device)
+        model_input = {
+            'llm_embedding': embedding,
+            'flow_embedding': embedding,
+        }
+        return model_input
+

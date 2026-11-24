@@ -24,7 +24,7 @@ import uuid
 from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
 from cosyvoice.utils.common import TrtContextWrapper
-
+from cosyvoice.utils.file_utils import logging
 
 class CosyVoiceModel:
 
@@ -100,7 +100,8 @@ class CosyVoiceModel:
 
     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
         cur_silent_token_num, max_silent_token_num = 0, 5
-        with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
+        # with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
+        with torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
             if isinstance(text, Generator):
                 assert (self.__class__.__name__ != 'CosyVoiceModel') and not hasattr(self.llm, 'vllm'), 'streaming input text is only implemented for CosyVoice2/3 and do not support vllm!'
                 token_generator = self.llm.inference_bistream(text=text,
@@ -279,12 +280,23 @@ class CosyVoice2Model(CosyVoiceModel):
         self.flow.encoder = flow_encoder
 
     def load_vllm(self, model_dir):
+        # os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllmProfile"
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
         from vllm import EngineArgs, LLMEngine
+        # engine_args = EngineArgs(model=model_dir,
+        #                          skip_tokenizer_init=True,
+        #                          enable_prompt_embeds=True,
+        #                          gpu_memory_utilization=0.2,
+        #                          compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"})
         engine_args = EngineArgs(model=model_dir,
+                                 dtype='float16', #new added on 2026/2/10
                                  skip_tokenizer_init=True,
                                  enable_prompt_embeds=True,
-                                 gpu_memory_utilization=0.2)
+                                 gpu_memory_utilization=0.5, #adjust from 0.2 to 0.9, then to 0.5
+                                 additional_config={"torchair_graph_config":{"enabled":True}}, #new added on 2026/2/10
+                                 #compilation_config={'cudagraph_capture_sizes':[1,2,4,8,16,24],"cudagraph_mode": "FULL_DECODE_ONLY"}) #add capture size on 2026/2/9, change cudagraph_mode from FULL_DECODE_ONLY to FULL
+                                 compilation_config={'cudagraph_capture_sizes':[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128,512,1024],"cudagraph_mode": "FULL"},
+                                 enable_prefix_caching=True)
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers
@@ -344,8 +356,14 @@ class CosyVoice2Model(CosyVoiceModel):
             token_offset = 0
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
             while True:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
+                if token_offset == 0: #将首包改为 20token
+                    #this_token_hop_len = 20
+                    this_token_hop_len = 10
+                    #this_token_hop_len = 9
+                    #print("len(self.tts_speech_token_dict[this_uuid]): ", len(self.tts_speech_token_dict[this_uuid]))
+                    #print("self.flow.pre_lookahead_len: ", self.flow.pre_lookahead_len)
                 if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
                     this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
@@ -400,7 +418,9 @@ class CosyVoice3Model(CosyVoice2Model):
                  llm: torch.nn.Module,
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
-                 fp16: bool = False):
+                 fp16: bool = False,
+                 model_dir: str = None,
+                 graph_mode: bool = False):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.llm = llm
         self.flow = flow
@@ -421,6 +441,10 @@ class CosyVoice3Model(CosyVoice2Model):
         self.hift_cache_dict = {}
         # FSQ silent and breath token
         self.silent_tokens = [1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323]
+
+        # 进程池相关
+        self.model_dir = model_dir
+        self.graph_mode = graph_mode
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):
