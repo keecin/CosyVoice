@@ -296,7 +296,8 @@ class CosyVoice2Model(CosyVoiceModel):
                                  additional_config={"torchair_graph_config":{"enabled":True}}, #new added on 2026/2/10
                                  #compilation_config={'cudagraph_capture_sizes':[1,2,4,8,16,24],"cudagraph_mode": "FULL_DECODE_ONLY"}) #add capture size on 2026/2/9, change cudagraph_mode from FULL_DECODE_ONLY to FULL
                                  compilation_config={'cudagraph_capture_sizes':[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128,512,1024],"cudagraph_mode": "FULL"},
-                                 enable_prefix_caching=True)
+                                 enable_prefix_caching=True,
+                                 enforce_eager=True)
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers

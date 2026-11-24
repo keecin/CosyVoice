@@ -23,10 +23,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
-from typing import Optional
+from typing import Iterable, Optional, Union
 from packaging.version import parse as vparse
 import vllm
-from typing import Union
 
 # vLLM-0.11.0+ only support V1 engine
 VLLM_V1_ENGINE_ONLY: bool = vparse(vllm.__version__) >= vparse("0.11.0")
@@ -80,8 +79,13 @@ class CosyVoice2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # vLLM >= 0.30 renamed get_input_embeddings -> embed_input_ids and uses
+        # this method name as part of the VllmModel interface check.
+        return self.model.embed_input_ids(input_ids)
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
@@ -109,9 +113,11 @@ class CosyVoice2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."]
-                           if self.config.tie_word_embeddings else None),
-        )
+        # vLLM >= 0.30 renamed AutoWeightsLoader(skip_prefixes=...) to
+        # ignore_unexpected_prefixes=... .
+        if self.config.tie_word_embeddings:
+            loader = AutoWeightsLoader(
+                self, ignore_unexpected_prefixes=["lm_head."])
+        else:
+            loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
