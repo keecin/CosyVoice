@@ -543,7 +543,18 @@ class Qwen2LM(TransformerLM):
                                              min_tokens=min_len,
                                              max_tokens=max_len)
             with self.lock:
-                self.vllm.add_request(uuid, {"prompt_embeds": lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)}, sampling_params)
+                # vLLM >= 0.30: passing a raw {"prompt_embeds": ...} dict goes
+                # through the deprecated renderer/tokenizer path (which stalls
+                # when skip_tokenizer_init=True). Use a proper EmbedsInput and
+                # match the engine compute dtype.
+                try:
+                    from vllm.inputs import EmbedsInput
+                    _dtype = getattr(getattr(self.vllm, 'model_config', None), 'dtype', None) or torch.bfloat16
+                    _embeds = lm_input.squeeze(0).to(_dtype).to(lm_input.device)
+                    vllm_prompt = EmbedsInput(type="embeds", prompt_embeds=_embeds)
+                except Exception:
+                    vllm_prompt = {"prompt_embeds": lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)}
+                self.vllm.add_request(uuid, vllm_prompt, sampling_params)
                 self.vllm_output_queue[uuid] = queue.Queue()
             out_tokens = []
             while True:

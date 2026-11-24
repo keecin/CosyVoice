@@ -242,7 +242,6 @@ else:
     def export_cosyvoice2_vllm(model, model_path, device):
         if os.path.exists(model_path):
             return
-        assert False
         dtype = torch.bfloat16
         # lm_head
         use_bias = True if model.llm_decoder.bias is not None else False

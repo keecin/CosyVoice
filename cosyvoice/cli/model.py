@@ -281,6 +281,26 @@ class CosyVoice2Model(CosyVoiceModel):
 
     def load_vllm(self, model_dir):
         # os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllmProfile"
+        # Some Ascend images ship a patched vLLM with a debugpy.wait_for_client()
+        # hook inside EngineCore.add_request (blocks until a VS Code debugger
+        # attaches on port 5666). Neutralize it so headless inference works.
+        try:
+            import debugpy
+            debugpy.listen = lambda *a, **k: None
+            debugpy.wait_for_client = lambda *a, **k: None
+            debugpy.breakpoint = lambda *a, **k: None
+        except Exception:
+            pass
+        # This image reports both nvidia + ascend triton drivers as active, so
+        # vllm disables triton and vllm_ascend's triton kernels break. Mark the
+        # nvidia triton backend inactive (must happen before `import vllm`).
+        try:
+            from triton.backends import backends
+            _nb = backends.get('nvidia')
+            if _nb is not None and getattr(_nb, 'driver', None) is not None:
+                _nb.driver.is_active = lambda: False
+        except Exception:
+            pass
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
         from vllm import EngineArgs, LLMEngine
         # engine_args = EngineArgs(model=model_dir,
