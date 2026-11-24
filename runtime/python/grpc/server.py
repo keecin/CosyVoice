@@ -45,7 +45,39 @@ except ImportError:
 import threading
 import time
 import uuid
+
+# --- Ascend + vLLM 0.30 runtime fixes (MUST run before `import vllm`) ---------
+# 1) run the V1 engine in-process so the custom model registration is visible
+os.environ.setdefault('VLLM_ENABLE_V1_MULTIPROCESSING', '0')
+# 2) this image reports both nvidia+ascend triton drivers -> vllm disables
+#    triton -> vllm_ascend triton kernels break. Mark nvidia backend inactive.
+try:
+    from triton.backends import backends
+    _nb = backends.get('nvidia')
+    if _nb is not None and getattr(_nb, 'driver', None) is not None:
+        _nb.driver.is_active = lambda: False
+except Exception:
+    pass
+# 3) neutralize the debugpy.wait_for_client() hook injected into
+#    EngineCore.add_request by this patched vLLM image
+try:
+    import debugpy
+    debugpy.listen = lambda *a, **k: None
+    debugpy.wait_for_client = lambda *a, **k: None
+    debugpy.breakpoint = lambda *a, **k: None
+except Exception:
+    pass
+# -----------------------------------------------------------------------------
+
 import vllm
+# register the custom architecture used by the exported vLLM model dir
+try:
+    from vllm import ModelRegistry
+    from cosyvoice.vllm.cosyvoice2 import CosyVoice2ForCausalLM
+    ModelRegistry.register_model("CosyVoice2ForCausalLM", CosyVoice2ForCausalLM)
+except Exception as _e:
+    logging.warning(f"register CosyVoice2ForCausalLM failed: {_e}")
+
 import queue
 import torchair as tng
 from torchair.configs.compiler_config import CompilerConfig
@@ -410,6 +442,19 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
         self.inference_work_thread = threading.Thread(target=self.infer, daemon=True)
         self.inference_work_thread.start()
 
+        # 方案1：在 gRPC 线程启动前，先跑一遍完整流水线，触发 CANN TBE
+        # 知识库(repository_manager)与 Flow/HiFi 算子的懒加载/编译，使其在
+        # “没有 gRPC 线程”的环境里完成初始化（避免多线程里 fork 崩溃）。
+        if not getattr(args, 'no_prewarm', False):
+            thc_print("prewarm (pre-grpc): start")
+            try:
+                self.warmup()
+                thc_print("prewarm (pre-grpc): done")
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                thc_print("prewarm (pre-grpc): FAILED (continue)")
+
         # 启动vllm profile（通过参数控制）
         if args.enable_vllm_profile:
             assert False
@@ -454,6 +499,10 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
             requests_remain_token_len[request_id] = new_token_len
             calc_cum_dt = (now - request_info.metric.t2w[0].end).total_seconds()
             requests_slack[request_id] = request_info.speech_cum_dt - calc_cum_dt
+
+        if len(requests_remain_token_len) == 0:
+            # no pending non-first tokens for any request -> nothing to schedule
+            return {}
 
         flag = [len(request_info.sections) >= 1 for request_info in self.requests_info.values()]
         available_token_len = self.t2w_total_token_len[len(flag) == args.max_conc and all(flag)]
@@ -1008,11 +1057,8 @@ def main():
     grpcServer.add_insecure_port('0.0.0.0:{}'.format(args.port))
     grpcServer.start()
 
-    if args.graph_mode:
-        thc_print(f"warmup: start")
-        service.warmup()
-        thc_print(f"warmup: end")
-
+    # NOTE pre-warm now happens inside CosyVoiceServiceImpl.__init__ (before the
+    # gRPC server/threads start) to avoid CANN TBE fork-in-multithread crashes.
     logging.info("server listening on 0.0.0.0:{}".format(args.port))
     grpcServer.wait_for_termination()
 
