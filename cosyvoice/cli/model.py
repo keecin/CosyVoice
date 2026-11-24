@@ -280,6 +280,16 @@ class CosyVoice2Model(CosyVoiceModel):
 
     def load_vllm(self, model_dir):
         # os.environ["VLLM_TORCH_PROFILER_DIR"] = "./vllmProfile"
+        # This image reports both nvidia + ascend triton drivers as active, so
+        # vllm disables triton and vllm_ascend's triton kernels break. Mark the
+        # nvidia triton backend inactive (must happen before `import vllm`).
+        try:
+            from triton.backends import backends
+            _nb = backends.get('nvidia')
+            if _nb is not None and getattr(_nb, 'driver', None) is not None:
+                _nb.driver.is_active = lambda: False
+        except Exception:
+            pass
         export_cosyvoice2_vllm(self.llm, model_dir, self.device)
         from vllm import EngineArgs, LLMEngine
         # engine_args = EngineArgs(model=model_dir,
