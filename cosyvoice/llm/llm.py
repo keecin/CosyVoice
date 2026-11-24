@@ -239,11 +239,44 @@ class Qwen2Encoder(torch.nn.Module):
         )
         return outs.hidden_states[-1], masks.unsqueeze(1)
 
-    def forward_one_step(self, xs, masks, cache=None):
-        input_masks = masks[:, -1, :]
+    @staticmethod
+    def _cache_len(cache):
+        """Number of cached (past) tokens, for legacy tuple cache
+        (transformers<5) or DynamicCache (transformers>=5)."""
+        if cache is None:
+            return 0
+        if hasattr(cache, 'get_seq_length'):
+            return cache.get_seq_length()
+        try:
+            return cache[0][0].shape[-2]
+        except (IndexError, TypeError, AttributeError):
+            return 0
+
+    def forward_one_step(self, xs, masks=None, cache=None):
+        # Build the attention mask from the TOTAL length (past + current).
+        # Passing a mask with only the current length makes incremental
+        # decoding attend to the KV cache incorrectly under transformers>=5
+        # (produces inconsistent/garbage outputs), while it happened to work
+        # with the legacy cache in transformers<5.
+        past_len = self._cache_len(cache)
+        # Keep the incremental input dtype consistent with the cached K/V.
+        # CosyVoice blends embeddings of different dtypes (the Qwen text
+        # embed_tokens is bf16 from the checkpoint while speech/llm embeddings
+        # are fp32). A plain concat promotes to fp32 for the prefill, but a
+        # text-only chunk (bistream) can arrive as bf16 and then mismatch the
+        # fp32 KV cache inside SDPA. Casting to the cache dtype avoids this.
+        if cache is not None:
+            try:
+                cache_dtype = cache.layers[0].keys.dtype if hasattr(cache, 'layers') else cache[0][0].dtype
+            except (IndexError, TypeError, AttributeError):
+                cache_dtype = None
+            if cache_dtype is not None and xs.dtype != cache_dtype:
+                xs = xs.to(cache_dtype)
+        total_len = past_len + xs.size(1)
+        attention_mask = torch.ones((1, total_len), device=xs.device, dtype=torch.bool)
         outs = self.model(
             inputs_embeds=xs,
-            attention_mask=input_masks,
+            attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
             use_cache=True,
@@ -618,10 +651,7 @@ class Qwen2LM(TransformerLM):
                         logging.info('not enough text token to decode, wait for more')
                         continue
                 while True:
-                    seq_len = lm_input.shape[1] if cache is None else lm_input.shape[1] + cache[0][0].size(2)
-                    y_pred, cache = self.llm.forward_one_step(lm_input,
-                                                              masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
-                                                              cache=cache)
+                    y_pred, cache = self.llm.forward_one_step(lm_input, cache=cache)
                     logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
                     if next_fill_index != -1 and len(out_tokens) == next_fill_index:
                         top_ids = self.fill_token
@@ -644,10 +674,7 @@ class Qwen2LM(TransformerLM):
         lm_input = torch.concat([lm_input, text_cache, task_id_emb], dim=1)
         logging.info('no more text token, decode until met eos')
         while True:
-            seq_len = lm_input.shape[1] if cache is None else lm_input.shape[1] + cache[0][0].size(2)
-            y_pred, cache = self.llm.forward_one_step(lm_input,
-                                                      masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
-                                                      cache=cache)
+            y_pred, cache = self.llm.forward_one_step(lm_input, cache=cache)
             logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=False)
             out_tokens.append(top_ids)
