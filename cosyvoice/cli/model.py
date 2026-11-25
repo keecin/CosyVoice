@@ -417,7 +417,9 @@ class CosyVoice3Model(CosyVoice2Model):
                  llm: torch.nn.Module,
                  flow: torch.nn.Module,
                  hift: torch.nn.Module,
-                 fp16: bool = False):
+                 fp16: bool = False,
+                 model_dir: str = None,
+                 graph_mode: bool = False):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.llm = llm
         self.flow = flow
@@ -438,6 +440,10 @@ class CosyVoice3Model(CosyVoice2Model):
         self.hift_cache_dict = {}
         # FSQ silent and breath token
         self.silent_tokens = [1, 2, 28, 29, 55, 248, 494, 2241, 2242, 2322, 2323]
+
+        # 进程池相关
+        self.model_dir = model_dir
+        self.graph_mode = graph_mode
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
         with torch.cuda.amp.autocast(self.fp16):

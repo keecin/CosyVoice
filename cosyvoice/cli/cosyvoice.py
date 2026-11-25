@@ -75,6 +75,11 @@ class CosyVoice:
         self.frontend.spk2info[zero_shot_spk_id] = model_input
         return True
 
+    def add_sft_spk(self, sft_spk_id):
+        model_input = self.frontend.frontend_from_spk2info(sft_spk_id)
+        self.frontend.spk2info_sft[sft_spk_id] = model_input
+        return True
+
     def save_spkinfo(self):
         torch.save(self.frontend.spk2info, '{}/spk2info.pt'.format(self.model_dir))
 
@@ -190,7 +195,7 @@ class CosyVoice2(CosyVoice):
 class CosyVoice3(CosyVoice2):
 
     def __init__(self, model_dir, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1,
-                 speaker_info_dir=None):
+                 speaker_info_dir=None, graph_mode=False):
         self.model_dir = model_dir
         self.fp16 = fp16
         if not os.path.exists(model_dir):
@@ -211,7 +216,8 @@ class CosyVoice3(CosyVoice2):
         if torch.cuda.is_available() is False and (load_trt is True or fp16 is True):
             load_trt, fp16 = False, False
             logging.warning('no cuda device, set load_trt/fp16 to False')
-        self.model = CosyVoice3Model(configs['llm'], configs['flow'], configs['hift'], fp16)
+        self.model = CosyVoice3Model(configs['llm'], configs['flow'], configs['hift'], fp16,
+                                     model_dir=model_dir, graph_mode=graph_mode)
         self.model.load('{}/llm.pt'.format(model_dir),
                         '{}/flow.pt'.format(model_dir),
                         '{}/hift.pt'.format(model_dir))
