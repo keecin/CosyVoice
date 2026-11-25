@@ -301,10 +301,10 @@ class CosyVoice2Model(CosyVoiceModel):
                                  dtype='float16', #new added on 2026/2/10
                                  skip_tokenizer_init=True,
                                  enable_prompt_embeds=True,
-                                 gpu_memory_utilization=0.5, #adjust from 0.2 to 0.9, then to 0.5
+                                 gpu_memory_utilization=0.5, #keep 0.5: 0.9 OOMs Flow/HiFT in main proc (spawn EngineCore reserves 90% HBM)
                                  additional_config={"torchair_graph_config":{"enabled":True}}, #new added on 2026/2/10
-                                 #compilation_config={'cudagraph_capture_sizes':[1,2,4,8,16,24],"cudagraph_mode": "FULL_DECODE_ONLY"}) #add capture size on 2026/2/9, change cudagraph_mode from FULL_DECODE_ONLY to FULL
-                                 compilation_config={'cudagraph_capture_sizes':[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,128,512,1024],"cudagraph_mode": "FULL"},
+                                 #cudagraph capture sizes cover 1..20 (max_conc) so decode always hits graph
+                                 compilation_config={'cudagraph_capture_sizes':[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,32,64],"cudagraph_mode": "FULL_DECODE_ONLY"},
                                  enable_prefix_caching=True)
         self.llm.vllm = LLMEngine.from_engine_args(engine_args)
         self.llm.lock = threading.Lock()
