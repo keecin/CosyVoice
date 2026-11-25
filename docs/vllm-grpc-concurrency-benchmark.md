@@ -162,3 +162,91 @@ done
   否则会出现 “Free memory < desired gpu_memory_utilization” 启动失败。
 - 文本/发音人固定（spk1），未覆盖不同长度文本对 TTFB/RTF 的影响；如需更严谨，可扫文本长度。
 - 与 HF 后端的“同口径”对比未做（MindIE 服务强绑定 vLLM）；本报告聚焦 vLLM 的**并发扩展性**。
+
+---
+
+## 6. 用 MindIE 部署方式（run_server_npu.sh）实测
+
+为了对齐 MindIE single_timbre_fm_batch 的**部署方式**，新增了脚本
+`runtime/python/grpc/run_server_npu.sh`：沿用其 `run_server.sh` 的环境变量
+（`VLLM_WORKER_MULTIPROC_METHOD=spawn`、`TASK_QUEUE_ENABLE`、`CPU_AFFINITY_CONF`、
+`VLLM_ASCEND_ENABLE_MLP_OPTIMIZE`、`VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION`、
+`LD_PRELOAD=libjemalloc`），但把作者写死的模型路径/卡号改为参数化（`MODEL_DIR`、
+`SPEAKER_INFO_DIR`、`ASCEND_RT_VISIBLE_DEVICES`、`MAX_CONC`、`PORT`、`GRAPH_MODE`）。
+
+用法（6 卡、8 并发）：
+```sh
+cd runtime/python/grpc
+MODEL_DIR=/path/Fun-CosyVoice3-0.5B SPEAKER_INFO_DIR=/path/.../speaker_info \
+ASCEND_RT_VISIBLE_DEVICES=6 MAX_CONC=8 PORT=50192 GRAPH_MODE=0 bash run_server_npu.sh
+# 客户端：
+python3 batch_test_client.py --host 127.0.0.1 --port 50192 --stream \
+  --mode zero_shot_by_id --spk_id spk1 --total_req 12 --concurrency 8 --save_task_id 9
+```
+
+实测（910B3 单卡 6，CosyVoice3，12 请求 / 并发 8，MindIE 那套环境变量）：
+
+| 配置 | 成功率 | 总 wall | 首包 TTFB | RTF(客户端) | 吞吐(audio/wall) |
+| :--- | :---: | ---: | ---: | ---: | ---: |
+| MindIE 环境变量 + `GRAPH_MODE=0` | 12/12 | 14.92 s | 799 ms | 0.66 | 9.14× |
+| （对照）不加这些 env、`graph_mode=0` | 12/12 | 14.33 s | 762 ms | 0.61 | 9.78× |
+
+`--save_task_id 9` 正常保存音频（`task_9.wav`）。服务端 `main process disappeared` 计数 0。
+
+**关于 MindIE 默认的 `--graph_mode`（GRAPH_MODE=1）——已打通（v3）：**
+按 vLLM 导出架构分流后（v3 的 `vllm/config.json` 是 `Qwen2ForCausalLM`）：v3 采用 MindIE 同款
+「spawn 多进程 V1 + grpc 启动后 warmup」（无启动前 prewarm、无自定义注册），并配合运行时替代
+（`TORCH_NPU_DEVICE_CAPABILITY`、nvidia triton 置非活跃、ATB source）。实测（910B3 单卡，max_conc2）：
+- 架构解析为 Qwen2ForCausalLM、prewarm 跳过、grpc 后 warmup 完成 → listening；
+- 客户端 **2/2 成功，wall 5.44s，首包 682ms，RTF 0.32，吞吐 4.44×**，保存 task_1.wav，
+  `main process disappeared` = 0。
+注意：graph_mode 启动明显更慢（vLLM cudagraph capture + 全流水线 warmup，约 5 分钟）。
+v2（`CosyVoice2ForCausalLM`）仍用 in-process + 注册（非 graph 路径，早前压测稳定）。
+结论：**v3 的 graph_mode 现已可用（与 MindIE 行为一致）**；默认仍建议 `GRAPH_MODE=0`（启动更快），
+需要 graph 模式时显式设 `GRAPH_MODE=1`。此前“graph_mode 不兼容”的结论作废。
+
+---
+
+## 7. 成对的“启动服务 / 测试客户端”脚本
+
+- **起服务**：`runtime/python/grpc/run_server_npu.sh`（MindIE 风格环境变量，参数化；见第 6 节）。
+- **测试客户端**：`runtime/python/grpc/test_client_npu.sh`（**单请求 + 批量压测二合一**）。
+
+### 与 MindIE 旧脚本的关系（吸收映射）
+| 旧脚本 | 作用 | 处理 |
+| :--- | :--- | :--- |
+| `start.sh` | **单机离线推理**：`taskset -c 192-223 python infer.py`（infer.py: transfer shim + set_compile_mode + `AutoModel(load_vllm=True)`，写死路径） | 不属于“服务/客户端”，该场景已由仓库 `run_npu.py` 覆盖；**不并入本对**（需要绑核可自行 `taskset ... python3 run_npu.py ...`） |
+| `run_client.sh` | 只是一组**示例命令清单**（`client.py` 单请求 + `batch_test_client.py` 批量），写死端口 50099 | **吸收为 `test_client_npu.sh`**（参数化，单请求/批量二选一） |
+| `client.py` | **单请求**客户端（发送一个请求、打印首包时延/RTF、保存单个 wav），支持 sft/zero_shot/cross_lingual/instruct/zero_shot_by_id | 保留为底层实现，由 `test_client_npu.sh` 的 `BENCH=0` 调用 |
+| `batch_test_client.py` | **批量/并发**压测客户端（total_req/concurrency、可选 text_file、save_task_id/save_audio_dir，打印成功率/TTFB/RTF/吞吐） | 保留为底层实现，由 `test_client_npu.sh` 的 `BENCH=1` 调用 |
+
+> 差异一句话：`client.py` 偏“单条请求 + 时延/RTF 观察”；`batch_test_client.py` 偏“多请求并发吞吐”。
+> `run_client.sh` 只是把这两者的命令示例堆在一起；我们把它收敛成一个带参数的 `test_client_npu.sh`。
+
+### 用法
+```sh
+cd runtime/python/grpc
+
+# 批量压测（默认 BENCH=1）：zero_shot_by_id，12 请求 / 8 并发，保存第 9 号音频
+MODE=zero_shot_by_id SPK_ID=spk1 TOTAL_REQ=12 CONCURRENCY=8 SAVE_TASK_ID=9 \
+  HOST=127.0.0.1 PORT=50000 bash test_client_npu.sh
+
+# 单请求（BENCH=0）：保存一个 wav
+BENCH=0 MODE=zero_shot_by_id SPK_ID=spk1 TTS_WAV=./demo.wav \
+  HOST=127.0.0.1 PORT=50000 bash test_client_npu.sh
+```
+（对应地起服务用：`MODEL_DIR=... SPEAKER_INFO_DIR=... ASCEND_RT_VISIBLE_DEVICES=6 MAX_CONC=8 PORT=50000 GRAPH_MODE=0 bash run_server_npu.sh`）
+
+### 校验（910B3 单卡 6，GRAPH_MODE=0）
+- 批量（2 请求 / 并发 2，save_task_id=1）：2/2 成功，wall 6.32s，首包 703ms，吞吐 3.82×，保存 `task_1.wav`。
+- 单请求（BENCH=0）：RTF 0.40，成功保存 wav；服务端 `main process disappeared` 计数 0。
+
+### 6.2 补充回归（arch 分流后）
+
+910B3 单卡、`run_server_npu.sh`：
+
+| 场景 | 结果 |
+| :--- | :--- |
+| v3 graph（`GRAPH_MODE=1`，max_conc=8，12 请求/并发 8） | **12/12 成功，wall 11.99s，首包 778ms，RTF 0.47，吞吐 11.91×**，`task_9.wav` 已存，disappeared=0；启动约 6 分钟（engine init+cudagraph capture+8 路 warmup ~3min） |
+| v3 非 graph（`GRAPH_MODE=0`，spawn + 启动前 prewarm，max_conc=2） | 2/2 成功，wall 5.60s，首包 702ms，RTF 0.33，吞吐 4.32× |
+| v2 gRPC（CosyVoice2 + 本 server） | **不支持**：报 `CosyVoice2.__init__() got an unexpected keyword argument 'speaker_info_dir'`（zero_shot_by_id/speaker 预加载与 graph_mode 仅加在 CosyVoice3 上，属设计限制）；v2 的 vLLM 路径请用 `run_npu.py --vllm` |
