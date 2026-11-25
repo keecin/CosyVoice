@@ -886,8 +886,11 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
 
         min_token_text_ratio = 2
         max_token_text_ratio = 20
-        min_len = int(text_len * min_token_text_ratio)
-        max_len = int(text_len * max_token_text_ratio)
+        # perf case 2.2.8: text_len 是 NPU tensor，多 gRPC 线程并发 int() 会做隐式 D2H
+        # 拷贝产生竞态（int() 返回垃圾值 -> min_tokens 非法 -> EZ9999 崩溃）。先 .item()。
+        text_len_val = text_len.item() if isinstance(text_len, torch.Tensor) else text_len
+        min_len = int(text_len_val * min_token_text_ratio)
+        max_len = int(text_len_val * max_token_text_ratio)
 
         # self.llm.inference_wrapper(lm_input, sampling, min_len, max_len, uuid)
         sampling = 25
