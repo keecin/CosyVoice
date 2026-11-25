@@ -460,6 +460,9 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
         self.t2w_first_token_len = 8 + self.t2w.post_gap_token_len  # perf case: 20+gap -> 8+gap, Flow starts earlier (TTFT)
         self.t2w_min_token_len = 8  # perf case: 25 -> 8, more frequent Flow triggers, less LLM-side idle
         self.t2w_total_token_len = {True: 800, False: 700}  # perf repo HEAD: 300/800 -> 700/800 (case seal used 1400/1600, rejected: throughput -7%)
+        # perf case 2.2.9: section 边界淡入（懒初始化 NPU tensor，避免运行时 host->device 拷贝）
+        self._fade_in_len = 64  # ~2.7ms at 24kHz
+        self._fade_in_window = None
         self.t2w_delay = 0.2
         self.release_timeout = 1
         self.t2w_timeout = 1
@@ -719,7 +722,17 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
                 if request_info.speech is None:
                     request_info.speech = output.speech
                 else:
-                    request_info.speech = torch.cat([request_info.speech, output.speech], dim=-1)
+                    # perf case 2.2.9: section 边界 64 采样点淡入（NPU tensor 级，~2.7ms@24k），
+                    # 消除拼接爆音；不要用 Python 逐样本循环（会使 RTF 翻倍）
+                    new_speech = output.speech
+                    if self._fade_in_window is None:
+                        self._fade_in_window = torch.tensor(
+                            np.linspace(0, 1, self._fade_in_len),
+                            dtype=new_speech.dtype, device=new_speech.device)
+                    fade_len = min(new_speech.shape[-1], self._fade_in_len)
+                    new_speech = new_speech.clone()
+                    new_speech[..., :fade_len] = new_speech[..., :fade_len] * self._fade_in_window[:fade_len]
+                    request_info.speech = torch.cat([request_info.speech, new_speech], dim=-1)
                 request_info.speech_cum_dt += output.speech_dt
                 request_info.metric.t2w[section_idx].stop()
                 request_info.done = any([section.finalize for section in request_info.sections])
