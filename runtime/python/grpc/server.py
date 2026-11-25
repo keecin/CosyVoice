@@ -459,7 +459,7 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
         self.t2w.prompt_wave_info = {**self.cosyvoice.frontend.spk2info, **self.cosyvoice.frontend.spk2info_sft}
         self.t2w_first_token_len = 8 + self.t2w.post_gap_token_len  # perf case: 20+gap -> 8+gap, Flow starts earlier (TTFT)
         self.t2w_min_token_len = 8  # perf case: 25 -> 8, more frequent Flow triggers, less LLM-side idle
-        self.t2w_total_token_len = {True: 800, False: 300}
+        self.t2w_total_token_len = {True: 800, False: 700}  # perf repo HEAD: 300/800 -> 700/800 (case seal used 1400/1600, rejected: throughput -7%)
         self.t2w_delay = 0.2
         self.release_timeout = 1
         self.t2w_timeout = 1
