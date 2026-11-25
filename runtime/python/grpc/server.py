@@ -542,6 +542,26 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
                 thc_print(f"postprocess_vllm_outputs: abort_requests_id = {abort_requests_id}")
                 self.cosyvoice.model.llm.vllm.abort_request(abort_requests_id)
 
+        self.t2w_fill_lookahead = 20  # perf case 2.2.12: 最多多等 20 token 找 fill_token
+        self.t2w_fill_token_id = None  # 延迟初始化
+
+    def _find_fill_aware_cut(self, llm_output, history_len, alloc_token_len, max_alloc):
+        """在 alloc_token_len 附近寻找 fill_token（模型自带的语义分段标记）作为切割点。
+        若 [alloc, alloc+lookahead) 内出现 fill_token，则在它之后切；否则保持原值。
+        比固定阈值切割更可能落在词/短语边界，降低连音/浊化。"""
+        if self.t2w_fill_token_id is None:
+            try:
+                self.t2w_fill_token_id = self.cosyvoice.model.llm.fill_token
+            except AttributeError:
+                self.t2w_fill_token_id = self.cosyvoice.model.llm.stop_token_ids[-1] + 1
+        start = history_len + alloc_token_len
+        end = min(history_len + max_alloc, len(llm_output))
+        lookahead_end = min(start + self.t2w_fill_lookahead, end)
+        for i in range(start, lookahead_end):
+            if llm_output[i] == self.t2w_fill_token_id:
+                return i - history_len + 1  # fill_token 计入前一个 section
+        return alloc_token_len
+
     def schedule_nonfirst_requests_t2w(self, now):
         requests_history_token_len = {}
         requests_remain_token_len = {}
@@ -606,6 +626,12 @@ class CosyVoiceServiceImpl(cosyvoice_pb2_grpc.CosyVoiceServicer):
                 request_info = self.requests_info[request_id]
                 assert requests_t2w_sched[request_id]['alloc_len'] == 0
                 alloc_token_len = min(requests_remain_token_len[request_id], t2w_min_token_len)
+                # perf case 2.2.12: fill_token 感知切割
+                max_alloc = min(requests_remain_token_len[request_id],
+                                available_token_len - self.t2w.pre_gap_token_len - self.t2w.post_gap_token_len)
+                alloc_token_len = self._find_fill_aware_cut(request_info.llm_output,
+                                                           requests_history_token_len[request_id],
+                                                           alloc_token_len, max_alloc)
                 alloc_token_len_with_overhead = alloc_token_len + self.t2w.pre_gap_token_len + self.t2w.post_gap_token_len
                 available_token_len -= alloc_token_len_with_overhead
                 requests_remain_token_len[request_id] -= alloc_token_len
