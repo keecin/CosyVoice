@@ -311,7 +311,8 @@ class Token2Wave():
         flow_embedding = self.prompt_wave_info[spk_id]['flow_embedding']
         stream = True
         finalize = False
-        n_timesteps = 5 if any([request.first for request in batch_requests]) else 10
+        # perf case 1310304325630799872: 首段 8 步固定音质基线，后续段 5 步（原 10/5）
+        n_timesteps = 8 if any([request.first for request in batch_requests]) else 5
 
         return batch_requests, tokens, token_len, flow_prompt_speech_token, flow_prompt_speech_token_len, prompt_speech_feat, prompt_speech_feat_len, flow_embedding, stream, finalize, n_timesteps
 
