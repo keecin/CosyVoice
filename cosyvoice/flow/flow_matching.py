@@ -63,9 +63,16 @@ class ConditionalCFM(BASECFM):
         mu_cache = torch.concat([mu[:, :, :prompt_len], mu[:, :, -34:]], dim=2)
         cache = torch.stack([z_cache, mu_cache], dim=-1)
 
-        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        if self.t_scheduler == 'cosine':
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        # perf case 7.3: t_span 预计算缓存（原先每次推理都重算 linspace/cos）
+        if not hasattr(self, '_t_span_cache'):
+            self._t_span_cache = {}
+        key = (n_timesteps, self.t_scheduler)
+        if key not in self._t_span_cache:
+            ts = torch.linspace(0, 1, n_timesteps + 1)
+            if self.t_scheduler == 'cosine':
+                ts = 1 - torch.cos(ts * 0.5 * torch.pi)
+            self._t_span_cache[key] = ts
+        t_span = self._t_span_cache[key].to(device=mu.device, dtype=mu.dtype)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
     def solve_euler(self, x, t_span, mu, mask, spks, cond, streaming=False):
@@ -197,7 +204,7 @@ class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
         set_all_random_seed(0)
-        self.rand_noise = torch.randn([1, 80, 50 * 300])
+        # perf case 7.3: rand_noise 改为按需在 NPU 上生成（原为 1.2MB CPU 张量，每次 .to(device)）
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming=False):
@@ -219,9 +226,15 @@ class CausalConditionalCFM(ConditionalCFM):
                 shape: (batch_size, n_feats, mel_timesteps)
         """
 
-        z = self.rand_noise[:, :, :mu.size(2)].to(mu.device).to(mu.dtype) * temperature
+        z = torch.randn(1, 80, mu.size(2), device=mu.device, dtype=mu.dtype) * temperature
         # fix prompt and overlap part mu and z
-        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        if self.t_scheduler == 'cosine':
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        if not hasattr(self, '_t_span_cache'):
+            self._t_span_cache = {}
+        key = (n_timesteps, self.t_scheduler)
+        if key not in self._t_span_cache:
+            ts = torch.linspace(0, 1, n_timesteps + 1)
+            if self.t_scheduler == 'cosine':
+                ts = 1 - torch.cos(ts * 0.5 * torch.pi)
+            self._t_span_cache[key] = ts
+        t_span = self._t_span_cache[key].to(device=mu.device, dtype=mu.dtype)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None

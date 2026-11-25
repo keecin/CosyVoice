@@ -16,6 +16,7 @@
 
 from typing import Dict, Optional, List
 import numpy as np
+import math
 from scipy.signal import get_window
 import torch
 import torch.nn as nn
@@ -162,13 +163,12 @@ class SineGen(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         f0 = f0.transpose(1, 2)
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
-        for i in range(self.harmonic_num + 1):
-            F_mat[:, i: i + 1, :] = f0 * (i + 1) / self.sampling_rate
+        # perf case 7.2: 谐波循环 -> 向量化；CPU Uniform 采样 -> NPU 直接生成
+        harmonics = torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).view(1, -1, 1)
+        F_mat = f0 * harmonics / self.sampling_rate
 
-        theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
-        u_dist = Uniform(low=-np.pi, high=np.pi)
-        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+        theta_mat = 2 * math.pi * (torch.cumsum(F_mat, dim=-1) % 1)
+        phase_vec = torch.rand(f0.size(0), self.harmonic_num + 1, 1, device=f0.device, dtype=f0.dtype) * 2 * math.pi - math.pi
         phase_vec[:, 0, :] = 0
 
         # generate sine waveforms
