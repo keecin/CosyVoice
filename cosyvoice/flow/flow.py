@@ -21,7 +21,6 @@ from omegaconf import DictConfig
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.utils.onnx import SpeechTokenExtractor, online_feature, onnx_path
 
-
 class MaskedDiffWithXvec(torch.nn.Module):
     def __init__(self,
                  input_size: int = 512,
@@ -73,7 +72,6 @@ class MaskedDiffWithXvec(torch.nn.Module):
         # concat text and prompt_text
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
-
         # text encode
         h, h_lengths = self.encoder(token, token_len)
         h = self.encoder_proj(h)
@@ -119,7 +117,6 @@ class MaskedDiffWithXvec(torch.nn.Module):
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
-
         # text encode
         h, h_lengths = self.encoder(token, token_len)
         h = self.encoder_proj(h)
@@ -207,7 +204,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         # concat text and prompt_text
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
-
         # text encode
         h, h_lengths = self.encoder(token, token_len, streaming=streaming)
         h = self.encoder_proj(h)
@@ -252,7 +248,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
-
         # text encode
         if finalize is True:
             h, h_lengths = self.encoder(token, token_len, streaming=streaming)
@@ -341,7 +336,6 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         # concat text and prompt_text
         mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(device)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
-
         # text encode
         h = self.pre_lookahead_layer(token)
         h = h.repeat_interleave(self.token_mel_ratio, dim=1)
@@ -376,7 +370,8 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
                   prompt_feat_len,
                   embedding,
                   streaming,
-                  finalize):
+                  finalize,
+                  n_timesteps=None):
         assert token.shape[0] == 1
         # xvec projection
         embedding = F.normalize(embedding, dim=1)
@@ -386,7 +381,6 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
-
         # text encode
         if finalize is True:
             h = self.pre_lookahead_layer(token)
@@ -406,7 +400,7 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=10 if n_timesteps is None else n_timesteps,
             streaming=streaming
         )
         feat = feat[:, :, mel_len1:]

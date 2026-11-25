@@ -26,6 +26,7 @@
 from typing import Optional
 from packaging.version import parse as vparse
 import vllm
+from typing import Union
 
 # vLLM-0.11.0+ only support V1 engine
 VLLM_V1_ENGINE_ONLY: bool = vparse(vllm.__version__) >= vparse("0.11.0")
@@ -99,7 +100,7 @@ class CosyVoice2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         sampling_metadata: Optional[SamplingMetadata] = None,
     ) -> Optional[torch.Tensor]:
         if VLLM_V1_ENGINE_ONLY:
-            logits = self.logits_processor(self.lm_head, hidden_states,
+            logits = self.logits_processor(self.lm_head, hidden_states, 
                                            self.lm_head.bias)
         else:
             logits = self.logits_processor(self.lm_head, hidden_states,
